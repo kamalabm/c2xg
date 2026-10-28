@@ -216,7 +216,10 @@ class Candidates(object):
         print("\t\tNow parsing candidates to find frequencies")
         #Parse candidates in data because extraction won't estimate frequencies
         candidates_pool = list(ct.partition_all(1000, candidates))
-        pool_instance = mp.Pool(processes = min(25, mp.cpu_count()), maxtasksperchild = 1)
+        # Use SLURM_CPUS_PER_TASK if available, otherwise default to min(40, cpu_count)
+        import os
+        n_workers = int(os.environ.get('SLURM_CPUS_PER_TASK', min(40, mp.cpu_count())))
+        pool_instance = mp.Pool(processes = n_workers, maxtasksperchild = 1)
         frequencies = pool_instance.map(partial(process_parsing, data = input_data), candidates_pool, chunksize = 1)
         pool_instance.close()
         pool_instance.join()  
