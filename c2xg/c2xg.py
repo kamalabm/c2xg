@@ -893,9 +893,20 @@ class C2xG(object):
 
         #Combine grammars
         print("Merging scaffolded grammars")
-        grammar_df_lex.loc[:,"Type"] = "Lexical-Only"
-        grammar_df_syn.loc[:,"Type"] = "Syntactic-Only"
-        grammar_df_full.loc[:,"Type"] = "Full Grammar"
+        def _tag(df, label):
+            # Normalize to a DataFrame with at least a Chunk column and a defined (possibly empty) index
+            if df is None or not isinstance(df, pd.DataFrame):
+                df = pd.DataFrame(columns=["Chunk"])
+            else:
+                df = df.copy()
+            if "Chunk" not in df.columns:
+                df["Chunk"] = pd.Series(dtype=object)
+            df["Type"] = label
+            return df
+
+        grammar_df_lex = _tag(grammar_df_lex, "Lexical-Only")
+        grammar_df_syn = _tag(grammar_df_syn, "Syntactic-Only")
+        grammar_df_full = _tag(grammar_df_full, "Full Grammar")
         grammar_df = pd.concat([grammar_df_lex, grammar_df_syn, grammar_df_full], axis = 0, ignore_index = True)
         grammar_df = grammar_df.drop_duplicates(subset = "Chunk", keep = "first")
         self.Load.clips = ct.merge(clips_lex, clips_syn, clips_full)
@@ -2106,6 +2117,10 @@ class C2xG(object):
     
         #Initialize results holder
         results = []
+
+        # If no clusters/constructions, return empty frame
+        if grammar_df is None or len(grammar_df) == 0:
+            return pd.DataFrame(columns=["Chunk", "Token Cluster", "Type Cluster"])
     
         #Restrict the search to within type-based clusters
         for cluster, cluster_df in grammar_df.groupby("Cluster"):
@@ -2136,6 +2151,8 @@ class C2xG(object):
 
             #Cluster
             cluster_df = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix, num_clusters = range(int(len(grammar)/10)+11, 10, -10))
+            if cluster_df is None or len(cluster_df) == 0:
+                continue
             cluster_df.loc[:,"Type Cluster"] = cluster
             
             #Now merge micro-clusters with insufficient members
@@ -2150,11 +2167,14 @@ class C2xG(object):
                 #Not enough to keep
                 if len(temp_df) < 3:
                     update_clusters.append(temp_number)
-                    
+            
             #Now save token clusters
             cluster_df = cluster_df.replace(update_clusters, 0)
             results.append(cluster_df)
             
+        if not results:
+            return pd.DataFrame(columns=["Chunk", "Token Cluster", "Type Cluster"])
+
         cluster_df = pd.concat(results)
         cluster_df.columns = ["Chunk", "Token Cluster", "Type Cluster"]
         cluster_df.sort_values(by = ["Type Cluster", "Token Cluster"], ascending=True, inplace=True)

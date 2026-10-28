@@ -80,12 +80,16 @@ class Word_Classes(object):
         
         #Ensure not more clusters than words
         cluster_range = [x for x in list(cluster_range) if x < len(word_list)]
+        #If range emptied (e.g., small vocab vs default range), fall back to a single cluster
+        if not cluster_range:
+            cluster_range = [max(1, len(word_list))]
         
         #Get word vectors only for vocab
         vectors = []
         for word in word_list:
-            vector = model[word]
-            vectors.append(vector)      
+            # gensim FastText models in 4.x store vectors on .wv
+            vector = model.wv[word]
+            vectors.append(vector)
         vectors = np.vstack(vectors)
 
         print("Vocab and Vector Size:", end = "\t")
@@ -130,13 +134,16 @@ class Word_Classes(object):
             if n_turns_no_change > 0:
                 print("No change for 1 iterations, stopping now.")
                 break
+
+        # If no valid clustering found, fall back to single cluster
+        if len(cluster_labels) == 0:
+            cluster_labels = [0] * len(word_list)
+            cluster_exemplars = [0]
         
         results = []
         for i in range(len(cluster_labels)):
             member_word = word_list[i]
             cluster = cluster_labels[i]
-            exemplar_word = cluster_exemplars[cluster]
-            exemplar_word_real = word_list[exemplar_word]
             results.append([member_word, cluster])
         
         cluster_df = pd.DataFrame(results, columns = ["Word", "Cluster"])
@@ -150,16 +157,20 @@ class Word_Classes(object):
         for category, category_df in cluster_df.groupby("Cluster"):
 
             #First, get proto-type structure of the cluster
-            ranks = model.rank_by_centrality(words=category_df.loc[:,"Word"], use_norm=True)
+            # gensim FastText exposes rank_by_centrality on the KeyedVectors (.wv)
+            ranks = model.wv.rank_by_centrality(words=category_df.loc[:,"Word"], use_norm=True)
             ranks = pd.DataFrame(ranks, columns = ["Rank", "Word"])
+            if ranks.empty:
+                # create a minimal rank entry to keep the cluster
+                ranks = pd.DataFrame([[0.0, category_df.iloc[0]["Word"]]], columns=["Rank","Word"])
             ranks.loc[:,"Category"] = category            
 
             #Second, get the best example of the category
-            mean_vector = model.get_mean_vector(keys=ranks.loc[:,"Word"], weights=ranks.loc[:,"Rank"], pre_normalize=True, post_normalize=True)
+            mean_vector = model.wv.get_mean_vector(keys=ranks.loc[:,"Word"], weights=ranks.loc[:,"Rank"], pre_normalize=True, post_normalize=True)
             mean_dict[category] = mean_vector
 
             #Third, filter the best examples to reflect this particular lexicon
-            exemplars = model.similar_by_vector(mean_vector, topn=10000)
+            exemplars = model.wv.similar_by_vector(mean_vector, topn=10000)
             exemplars = [x for x,y in exemplars if x in vocab.keys()]
             exemplars = [x for x in exemplars if x in word_list]
             
@@ -178,17 +189,17 @@ class Word_Classes(object):
         phrase_results = []
 
         for phrase in phrase_list:
-            vector = model[phrase]
+            vector = model.wv[phrase]
             distances = pairwise_distances(vector.reshape(1, -1), list(mean_dict.values()), metric="cosine", n_jobs=mp.cpu_count())
             phrase_cluster = np.argmin(distances)
-            phrase_cluster_name = "_".join(name_dict[phrase_cluster])
+            phrase_cluster_name = "_".join(name_dict.get(phrase_cluster, name_dict.get(0, ["unk"])))
             phrase_results.append([0.0, phrase, phrase_cluster, phrase_cluster_name])
 
         #For CBOW, add unique_words as their own categories
         #For SG, unique_words do not belong to a cluster
         if variety == "cbow":
             unique_results = []
-            starting = max(name_dict.keys()) + 1
+            starting = max(name_dict.keys() or [0]) + 1
             
             for word in unique_words.loc[:,"Word"].values:
                 unique_results.append([0.0, word, starting, "unique_"+word])
@@ -210,6 +221,15 @@ class Word_Classes(object):
     #-------------------------------------------------------------------------------#
     
     def learn_construction_categories(self, grammar, similarity_matrix, num_clusters = None):
+        # If no constructions or empty similarity matrix, return empty frame
+        if grammar is None or len(grammar) == 0:
+            return pd.DataFrame(columns=["Chunk", "Cluster"])
+        try:
+            sim_size = getattr(similarity_matrix, "shape", (0,))[0]
+        except Exception:
+            sim_size = 0
+        if sim_size == 0:
+            return pd.DataFrame(columns=["Chunk", "Cluster"])
     
         #Set range of construction clusters
         if num_clusters == None:
@@ -221,6 +241,8 @@ class Word_Classes(object):
         optimum_clusters = 0
         optimum_sh = 0.0
         n_turns_no_change = 0
+        cluster_labels = []
+        cluster_exemplars = []
         
         print("\tStarting to cluster with a range of " + str(cluster_range))
         #Iterate over potential numbers of clusters
@@ -229,6 +251,8 @@ class Word_Classes(object):
             #Safety check
             if n_clusters > len(grammar):
                 n_clusters = len(grammar)-1
+            if n_clusters <= 0:
+                continue
                 
             km = kmedoids.fasterpam(diss = similarity_matrix, 
                                 medoids = n_clusters, 
@@ -257,6 +281,10 @@ class Word_Classes(object):
             if n_turns_no_change > 5:
                 print("No change for 6 iterations, stopping now.")
                 break
+        
+        # If nothing was clustered (e.g., too few items), return empty
+        if len(cluster_labels) == 0:
+            return pd.DataFrame(columns=["Chunk", "Cluster"])
         
         results = []
         for i in range(len(cluster_labels)):
