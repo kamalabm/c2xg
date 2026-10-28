@@ -189,7 +189,7 @@ class Association(object):
     
         print("\n\tCalculating association for " + str(len(list(ngrams.keys()))) + " pairs.")
         association_dict = defaultdict(dict)
-        total = ngrams["TOTAL"]
+        total = ngrams.get("TOTAL", 0)
 
         #Loop over pairs
         for key in ngrams.keys():

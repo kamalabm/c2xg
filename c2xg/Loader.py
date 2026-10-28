@@ -145,14 +145,19 @@ class Loader(object):
         word = str(word)
         
         if type == "cbow":
-            vector = self.cbow_model[word]
+            # If embeddings are unavailable, fall back to category 0
+            if not hasattr(self, "cbow_model") or self.cbow_model is False or not hasattr(self.cbow_model, "wv") or not self.cbow_centroids:
+                return 0
+            vector = self.cbow_model.wv[word]
             centroids = [self.cbow_centroids[x] for x in sorted(self.cbow_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1) 
             index = np.argmin(distances)
             self.cbow_encode[word] = index
             
         elif type == "sg":
-            vector = self.sg_model[word]
+            if not hasattr(self, "sg_model") or self.sg_model is False or not hasattr(self.sg_model, "wv") or not self.sg_centroids:
+                return 0
+            vector = self.sg_model.wv[word]
             centroids = [self.sg_centroids[x] for x in sorted(self.sg_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1)
             index = np.argmin(distances)
@@ -584,6 +589,13 @@ class Loader(object):
             threshold = lambda x: " " not in x
             full_lexicon = ct.keyfilter(threshold, full_lexicon)
 
+            # Handle empty lexicon gracefully
+            if len(full_lexicon) == 0:
+                full_lexicon_df = pd.DataFrame(columns=["Word", "Frequency", "Rank", "Actual_Frequency"])
+                unique_words = full_lexicon_df.copy()
+                full_lexicon_df.to_csv(os.path.join(self.out_dir, self.nickname+".full_lexicon.csv"), index=False)
+                return {}, phrases, unique_words, full_lexicon_df
+
             #Get Zipfian statistics about the full lexicon
             total_size = sum(full_lexicon.values())
             full_lexicon_df = pd.DataFrame.from_dict(full_lexicon, orient="index")
@@ -602,24 +614,25 @@ class Loader(object):
             full_lexicon_df.loc[:,"Frequency"] = np.log10(full_lexicon_df.loc[:,"Frequency"])
             full_lexicon_df.loc[:,"Rank"] = np.log10(full_lexicon_df.loc[:,"Rank"])
 
-            #Do regression and plot against actual data
-            regr = smf.ols(formula = 'Frequency ~ Rank', data = full_lexicon_df)
-            res = regr.fit()
+            #Do regression and plot against actual data (only if we have data)
+            if not full_lexicon_df.empty:
+                regr = smf.ols(formula = 'Frequency ~ Rank', data = full_lexicon_df)
+                res = regr.fit()
 
-            pred_ols = res.get_prediction()
-            iv_l = pred_ols.summary_frame()["obs_ci_lower"]
-            iv_u = pred_ols.summary_frame()["obs_ci_upper"]
-            fig, ax = plt.subplots(figsize=(8, 6))
-            y = full_lexicon_df.loc[:,"Frequency"]
-            x = full_lexicon_df.loc[:,"Rank"]
-            ax.plot(x, y, "o", label="Data")
-            ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
-            ax.plot(x, iv_u, "r--", alpha = 0.25)
-            ax.plot(x, iv_l, "r--", alpha = 0.25)
-            ax.legend(loc="best")
-            plt.xlabel("Rank (Log)")
-            plt.ylabel("Frequency (Log)")
-            plt.savefig(os.path.join(self.out_dir, self.nickname+".lexicon_distribution.png"), dpi=300, bbox_inches = "tight")
+                pred_ols = res.get_prediction()
+                iv_l = pred_ols.summary_frame()["obs_ci_lower"]
+                iv_u = pred_ols.summary_frame()["obs_ci_upper"]
+                fig, ax = plt.subplots(figsize=(8, 6))
+                y = full_lexicon_df.loc[:,"Frequency"]
+                x = full_lexicon_df.loc[:,"Rank"]
+                ax.plot(x, y, "o", label="Data")
+                ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
+                ax.plot(x, iv_u, "r--", alpha = 0.25)
+                ax.plot(x, iv_l, "r--", alpha = 0.25)
+                ax.legend(loc="best")
+                plt.xlabel("Rank (Log)")
+                plt.ylabel("Frequency (Log)")
+                plt.savefig(os.path.join(self.out_dir, self.nickname+".lexicon_distribution.png"), dpi=300, bbox_inches = "tight")
             
             #Reduce lexicon to min_count
             threshold = lambda x: x >= min_count
