@@ -362,20 +362,22 @@ class C2xG(object):
                 print("Current model file: " + model_name)
 
         #If no directories set, use default
-        if data_dir == None and in_dir == None:
+        if data_dir == None and in_dir == None and out_dir == None:
             data_dir = "data"
             in_dir = os.path.join(data_dir, "IN")
             out_dir = os.path.join(data_dir, "OUT")
-            
+
         #Set data location and use default in/out directories
         elif data_dir != None:
-            in_dir = os.path.join(data_dir, "IN")
-            out_dir = os.path.join(data_dir, "OUT")
-        
+            if in_dir == None:
+                in_dir = os.path.join(data_dir, "IN")
+            if out_dir == None:
+                out_dir = os.path.join(data_dir, "OUT")
+
         #Otherwise separately set the input and output directories
         else:
             data_dir = ""
-            
+
             #Maybe we set only one
             if in_dir == None:
                 in_dir = os.path.join(".", "IN")
@@ -828,21 +830,24 @@ class C2xG(object):
             print("\tMerging lexical grammar: " + str(len(grammar_df_lex)) + " with " + str(len(temp_grammar_df_lex)))
             grammar_df_lex = pd.concat([grammar_df_lex, temp_grammar_df_lex], axis = 0, ignore_index = True)
             grammar_df_lex = grammar_df_lex.drop_duplicates(subset = "Chunk", keep = "first")
-            grammar_df_lex.loc[:,"Type"] = "Lexical-Only"
+            if len(grammar_df_lex) > 0:
+                grammar_df_lex.loc[:,"Type"] = "Lexical-Only"
             print(grammar_df_lex)
             clips_lex = ct.merge(clips_lex, temp_clips_lex)
-                
+
             print("\tMerging syntactic grammar: " + str(len(grammar_df_syn)) + " with " + str(len(temp_grammar_df_syn)))
             grammar_df_syn = pd.concat([grammar_df_syn, temp_grammar_df_syn], axis = 0, ignore_index = True)
             grammar_df_syn = grammar_df_syn.drop_duplicates(subset = "Chunk", keep = "first")
-            grammar_df_syn.loc[:,"Type"] = "Syntactic-Only"
+            if len(grammar_df_syn) > 0:
+                grammar_df_syn.loc[:,"Type"] = "Syntactic-Only"
             print(grammar_df_syn)
             clips_syn = ct.merge(clips_syn, temp_clips_syn)
-                
+
             print("\tMerging full grammar: " + str(len(grammar_df_full)) + " with " + str(len(temp_grammar_df_full)))
             grammar_df_full = pd.concat([grammar_df_full, temp_grammar_df_full], axis = 0, ignore_index = True)
             grammar_df_full = grammar_df_full.drop_duplicates(subset = "Chunk", keep = "first")
-            grammar_df_full.loc[:,"Type"] = "Full Grammar"
+            if len(grammar_df_full) > 0:
+                grammar_df_full.loc[:,"Type"] = "Full Grammar"
             print(grammar_df_full)
             clips_full = ct.merge(clips_full, temp_clips_full)
         
@@ -893,9 +898,12 @@ class C2xG(object):
 
         #Combine grammars
         print("Merging scaffolded grammars")
-        grammar_df_lex.loc[:,"Type"] = "Lexical-Only"
-        grammar_df_syn.loc[:,"Type"] = "Syntactic-Only"
-        grammar_df_full.loc[:,"Type"] = "Full Grammar"
+        if len(grammar_df_lex) > 0:
+            grammar_df_lex.loc[:,"Type"] = "Lexical-Only"
+        if len(grammar_df_syn) > 0:
+            grammar_df_syn.loc[:,"Type"] = "Syntactic-Only"
+        if len(grammar_df_full) > 0:
+            grammar_df_full.loc[:,"Type"] = "Full Grammar"
         grammar_df = pd.concat([grammar_df_lex, grammar_df_syn, grammar_df_full], axis = 0, ignore_index = True)
         grammar_df = grammar_df.drop_duplicates(subset = "Chunk", keep = "first")
         self.Load.clips = ct.merge(clips_lex, clips_syn, clips_full)
@@ -1839,7 +1847,12 @@ class C2xG(object):
     #-------------------------------------------------------------------------------
     
     def print_examples_clusters(self, examples_dict, clusters_df, clips = None, output_file = None):
-    
+
+        # Handle empty DataFrame
+        if len(clusters_df) == 0:
+            print("\t No clusters to print examples for")
+            return
+
         #Add default output
         if output_file == None:
             output_file = self.nickname + ".grammar_clusters.txt"
@@ -1953,14 +1966,21 @@ class C2xG(object):
  
     #-------------------------------------------------------------------------------
     def clean_label(self, label):
-    
+
         start = label.find(":")
         label = label[start+1:]
 
         end = label.find("_")
         label = label[:end]
-        
-        return int(label)
+
+        # Handle 'None' or other non-numeric values
+        if label == 'None' or label == '':
+            return 0
+
+        try:
+            return int(label)
+        except ValueError:
+            return 0
     #-------------------------------------------------------------------------------
     
     def get_association_dict(self, df):
@@ -2063,9 +2083,9 @@ class C2xG(object):
         #Build np matrix for similarity
         similarity_matrix = np.array([np.array([self.construction_similarity(construction1, construction2) for construction2 in grammar]) for construction1 in grammar])
         print("\t Finished constructions similarity: " + str(similarity_matrix.shape))
-        
+
         #Cluster
-        cluster_df = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix)
+        cluster_df, mean_dict = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix)
 
         return cluster_df
  
@@ -2103,10 +2123,20 @@ class C2xG(object):
     #-----------------------------------------------  
     
     def get_token_similarity(self, grammar_df, examples_dict, n_chunks = 10000):
-    
+
+        # Handle invalid input
+        if not isinstance(grammar_df, pd.DataFrame):
+            print(f"\t Error: Expected DataFrame, got {type(grammar_df)}")
+            return pd.DataFrame(columns=["Rank", "Construction", "Cluster", "Cluster_Name", "Chunk"])
+
+        # Handle empty DataFrame
+        if len(grammar_df) == 0:
+            print("\t No constructions for token similarity, returning empty DataFrame")
+            return pd.DataFrame(columns=["Rank", "Construction", "Cluster", "Cluster_Name", "Chunk"])
+
         #Initialize results holder
         results = []
-    
+
         #Restrict the search to within type-based clusters
         for cluster, cluster_df in grammar_df.groupby("Cluster"):
             
@@ -2135,7 +2165,7 @@ class C2xG(object):
             print("\t Finished token similarity: " + str(similarity_matrix.shape))
 
             #Cluster
-            cluster_df = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix, num_clusters = range(int(len(grammar)/10)+11, 10, -10))
+            cluster_df, mean_dict = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix, num_clusters = range(int(len(grammar)/10)+11, 10, -10))
             cluster_df.loc[:,"Type Cluster"] = cluster
             
             #Now merge micro-clusters with insufficient members
@@ -2153,10 +2183,12 @@ class C2xG(object):
                     
             #Now save token clusters
             cluster_df = cluster_df.replace(update_clusters, 0)
-            results.append(cluster_df)
-            
+            # Select only the needed columns and rename them
+            cluster_df_subset = cluster_df[["Chunk", "Cluster", "Type Cluster"]].copy()
+            cluster_df_subset.columns = ["Chunk", "Token Cluster", "Type Cluster"]
+            results.append(cluster_df_subset)
+
         cluster_df = pd.concat(results)
-        cluster_df.columns = ["Chunk", "Token Cluster", "Type Cluster"]
         cluster_df.sort_values(by = ["Type Cluster", "Token Cluster"], ascending=True, inplace=True)
         print(cluster_df)
         return cluster_df

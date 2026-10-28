@@ -145,14 +145,16 @@ class Loader(object):
         word = str(word)
         
         if type == "cbow":
-            vector = self.cbow_model[word]
+            cbow_vectors = self.cbow_model.wv if hasattr(self.cbow_model, 'wv') else self.cbow_model
+            vector = cbow_vectors[word]
             centroids = [self.cbow_centroids[x] for x in sorted(self.cbow_centroids.keys())]
-            distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1) 
+            distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1)
             index = np.argmin(distances)
             self.cbow_encode[word] = index
-            
+
         elif type == "sg":
-            vector = self.sg_model[word]
+            sg_vectors = self.sg_model.wv if hasattr(self.sg_model, 'wv') else self.sg_model
+            vector = sg_vectors[word]
             centroids = [self.sg_centroids[x] for x in sorted(self.sg_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1)
             index = np.argmin(distances)
@@ -387,13 +389,14 @@ class Loader(object):
             #Get centroids for each cbow category for OOV words
             if self.cbow_centroids == False:
                 print("Creating centroids for local categories")
+                cbow_vectors = self.cbow_model.wv if hasattr(self.cbow_model, 'wv') else self.cbow_model
                 cbow_centroids = {}
                 for category, category_df in cbow_df.groupby("Category"):
                     category_name = str(category_df.loc[:,"Category_Name"].tolist()[0])
                     if "unique" not in category_name:
                         words = category_df.loc[:,"Category"].tolist()
                         ranks = category_df.loc[:,"Rank"].tolist()
-                        current_centroid =  self.cbow_model.get_mean_vector(keys=words, weights=ranks, pre_normalize=True, post_normalize=False)
+                        current_centroid =  cbow_vectors.get_mean_vector(keys=words, weights=ranks, pre_normalize=True, post_normalize=False)
                         cbow_centroids[category] = current_centroid
                 #Centroids as a list where the index = the cluster id
                 self.cbow_centroids = {}
@@ -404,13 +407,14 @@ class Loader(object):
             #Get centroids for each sg category for OOV words
             if self.sg_centroids == False:
                 print("Creating centroids for non-local categories")
+                sg_vectors = self.sg_model.wv if hasattr(self.sg_model, 'wv') else self.sg_model
                 sg_centroids = {}
                 for category, category_df in sg_df.groupby("Category"):
                     category_name = str(category_df.loc[:,"Category_Name"].tolist()[0])
                     if "unique" not in category_name:
                         words = category_df.loc[:,"Category"].tolist()
                         ranks = category_df.loc[:,"Rank"].tolist()
-                        current_centroid =  self.sg_model.get_mean_vector(keys=words, weights=ranks, pre_normalize=True, post_normalize=False)
+                        current_centroid =  sg_vectors.get_mean_vector(keys=words, weights=ranks, pre_normalize=True, post_normalize=False)
                         sg_centroids[category] = current_centroid
                 #Centroids as a list where the index = the cluster id
                 self.sg_centroids = {}
@@ -586,40 +590,62 @@ class Loader(object):
 
             #Get Zipfian statistics about the full lexicon
             total_size = sum(full_lexicon.values())
-            full_lexicon_df = pd.DataFrame.from_dict(full_lexicon, orient="index")
-            full_lexicon_df.reset_index(inplace=True)
-            full_lexicon_df.columns = ["Word", "Frequency"]
-            full_lexicon_df.sort_values("Frequency", inplace=True, ascending=False)
-            full_lexicon_df.loc[:,"Rank"] = full_lexicon_df.loc[:,"Frequency"].rank(axis=0, method='average', ascending=False)
+
+            # Handle empty lexicon
+            if len(full_lexicon) == 0:
+                full_lexicon_df = pd.DataFrame(columns=["Word", "Frequency"])
+            else:
+                full_lexicon_df = pd.DataFrame.from_dict(full_lexicon, orient="index")
+                full_lexicon_df.reset_index(inplace=True)
+                # Only set columns if we have the right number
+                if len(full_lexicon_df.columns) == 2:
+                    full_lexicon_df.columns = ["Word", "Frequency"]
+                elif len(full_lexicon_df.columns) == 1:
+                    # If only 1 column after reset, it's the index that became a column
+                    full_lexicon_df.columns = ["Word"]
+                    full_lexicon_df["Frequency"] = 0
+
+            if len(full_lexicon_df) > 0:
+                full_lexicon_df.sort_values("Frequency", inplace=True, ascending=False)
+                full_lexicon_df.loc[:,"Rank"] = full_lexicon_df.loc[:,"Frequency"].rank(axis=0, method='average', ascending=False)
+            else:
+                full_lexicon_df.loc[:,"Rank"] = []
+
             full_lexicon_df.to_csv(os.path.join(self.out_dir, self.nickname+".full_lexicon.csv"), index=False)
 
-            #Get a list of words which account for over 1% of the total data
+            #Get a list of words which account for over 0.5% of the total data
             threshold = total_size/100
             unique_words = full_lexicon_df[full_lexicon_df.loc[:,"Frequency"] > threshold]
 
-            #Prepare to estimate Zipfian distribution
-            full_lexicon_df.loc[:,"Actual_Frequency"] = full_lexicon_df.loc[:,"Frequency"]
-            full_lexicon_df.loc[:,"Frequency"] = np.log10(full_lexicon_df.loc[:,"Frequency"])
-            full_lexicon_df.loc[:,"Rank"] = np.log10(full_lexicon_df.loc[:,"Rank"])
+            #Prepare to estimate Zipfian distribution (only if we have valid data)
+            if len(full_lexicon_df) > 1 and (full_lexicon_df["Frequency"] > 0).all():
+                full_lexicon_df.loc[:,"Actual_Frequency"] = full_lexicon_df.loc[:,"Frequency"]
+                full_lexicon_df.loc[:,"Frequency"] = np.log10(full_lexicon_df.loc[:,"Frequency"])
+                full_lexicon_df.loc[:,"Rank"] = np.log10(full_lexicon_df.loc[:,"Rank"])
 
-            #Do regression and plot against actual data
-            regr = smf.ols(formula = 'Frequency ~ Rank', data = full_lexicon_df)
-            res = regr.fit()
+                #Do regression and plot against actual data
+                regr = smf.ols(formula = 'Frequency ~ Rank', data = full_lexicon_df)
+            else:
+                # Skip regression if insufficient data
+                regr = None
 
-            pred_ols = res.get_prediction()
-            iv_l = pred_ols.summary_frame()["obs_ci_lower"]
-            iv_u = pred_ols.summary_frame()["obs_ci_upper"]
-            fig, ax = plt.subplots(figsize=(8, 6))
-            y = full_lexicon_df.loc[:,"Frequency"]
-            x = full_lexicon_df.loc[:,"Rank"]
-            ax.plot(x, y, "o", label="Data")
-            ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
-            ax.plot(x, iv_u, "r--", alpha = 0.25)
-            ax.plot(x, iv_l, "r--", alpha = 0.25)
-            ax.legend(loc="best")
-            plt.xlabel("Rank (Log)")
-            plt.ylabel("Frequency (Log)")
-            plt.savefig(os.path.join(self.out_dir, self.nickname+".lexicon_distribution.png"), dpi=300, bbox_inches = "tight")
+            if regr is not None:
+                res = regr.fit()
+
+                pred_ols = res.get_prediction()
+                iv_l = pred_ols.summary_frame()["obs_ci_lower"]
+                iv_u = pred_ols.summary_frame()["obs_ci_upper"]
+                fig, ax = plt.subplots(figsize=(8, 6))
+                y = full_lexicon_df.loc[:,"Frequency"]
+                x = full_lexicon_df.loc[:,"Rank"]
+                ax.plot(x, y, "o", label="Data")
+                ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
+                ax.plot(x, iv_u, "r--", alpha = 0.25)
+                ax.plot(x, iv_l, "r--", alpha = 0.25)
+                ax.legend(loc="best")
+                plt.xlabel("Rank (Log)")
+                plt.ylabel("Frequency (Log)")
+                plt.savefig(os.path.join(self.out_dir, self.nickname+".lexicon_distribution.png"), dpi=300, bbox_inches = "tight")
             
             #Reduce lexicon to min_count
             threshold = lambda x: x >= min_count
