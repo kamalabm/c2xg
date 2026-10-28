@@ -4,6 +4,10 @@ from functools import partial
 from scipy import sparse
 from collections import defaultdict
 
+import os
+
+N_WORKERS = int(os.environ.get("SLURM_CPUS_PER_TASK", 8))
+
 #--------------------------------------------------------------#
 def parse_for_examples(construction, line):
 
@@ -334,7 +338,7 @@ class Parser(object):
         total_count = len(lines)
     
         #Multi-process by construction
-        pool_instance = mp.Pool(processes = mp.cpu_count(), maxtasksperchild = None)
+        pool_instance = mp.Pool(processes = N_WORKERS, maxtasksperchild = None)
         results = pool_instance.map(partial(parse_mdl_support, lines = lines), grammar, chunksize = 2500)
         pool_instance.close()
         pool_instance.join()
@@ -371,7 +375,7 @@ class Parser(object):
         total_count = len(lines)
     
         #Multi-process by construction
-        pool_instance = mp.Pool(processes = mp.cpu_count(), maxtasksperchild = 6)
+        pool_instance = mp.Pool(processes = N_WORKERS, maxtasksperchild = 6)
         results = pool_instance.map(partial(parse_clipping_support, constructions = grammar), lines, chunksize = 10)
         pool_instance.close()
         pool_instance.join()

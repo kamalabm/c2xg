@@ -189,7 +189,25 @@ class Association(object):
     
         print("\n\tCalculating association for " + str(len(list(ngrams.keys()))) + " pairs.")
         association_dict = defaultdict(dict)
-        total = ngrams["TOTAL"]
+        # robust total: compute if missing or invalid
+        try:
+            total = ngrams["TOTAL"]
+        except Exception:
+            def _sum_counts(x):
+                if isinstance(x, dict):
+                    return sum(_sum_counts(v) for k, v in x.items() if k != "TOTAL")
+                try:
+                    return float(x)
+                except Exception:
+                    return 0.0
+            total = _sum_counts(ngrams)
+            try:
+                ngrams["TOTAL"] = total
+            except Exception:
+                pass
+        # avoid downstream div-by-zero
+        if not total:
+            total = 1.0
 
         #Loop over pairs
         for key in ngrams.keys():

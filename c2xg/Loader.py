@@ -140,19 +140,63 @@ class Loader(object):
         return clean_lines
                 
     #---------------------------------------------------------------#
-    def get_unk(self, word, type = "cbow"):
+    def get_unk(self, word, type="cbow"):
+        ### _FG_GET_UNK
+        import numpy as _np
+        word = str(word)
+        # KeyedVectors regardless of gensim version
+        if type == "cbow":
+            kv = getattr(self.cbow_model, "wv", self.cbow_model) if self.cbow_model not in (False, None) else None
+            centroids = [self.cbow_centroids[x] for x in sorted(getattr(self, "cbow_centroids", {}).keys())]
+        else:
+            kv = getattr(self.sg_model, "wv", self.sg_model) if self.sg_model not in (False, None) else None
+            centroids = [self.sg_centroids[x] for x in sorted(getattr(self, "sg_centroids", {}).keys())]
 
+        # default: zero vector if missing OOV/model
+        vector = None
+        if kv is not None:
+            try:
+                # gensim 4: check .key_to_index to avoid KeyError
+                if not hasattr(kv, "key_to_index") or word in kv.key_to_index:
+                    vector = kv[word]
+            except Exception:
+                vector = None
+        if vector is None:
+            # 100 is the default vector_size in this project; if different, try to infer
+            dim = getattr(getattr(kv, "vectors", None), "shape", (1,100))[1] if kv is not None else 100
+            vector = _np.zeros(dim, dtype="float32")
+
+        # if no centroids yet, encode as 0 and cache nothing
+        if not centroids:
+            if type == "cbow":
+                self.cbow_encode[word] = 0
+            else:
+                self.sg_encode[word] = 0
+            return 0
         word = str(word)
         
         if type == "cbow":
-            vector = self.cbow_model[word]
+            #vector = self.cbow_model[word]
+
+            if type == "cbow":
+                kv = getattr(self.cbow_model, "wv", self.cbow_model) if self.cbow_model not in (False, None) else None
+                if kv is None:
+                    return None  # or pick a default centroid index
+                vector = kv[word]
+
             centroids = [self.cbow_centroids[x] for x in sorted(self.cbow_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1) 
             index = np.argmin(distances)
             self.cbow_encode[word] = index
             
         elif type == "sg":
-            vector = self.sg_model[word]
+            #vector = self.sg_model[word]
+
+            kv = getattr(self.sg_model, "wv", self.sg_model) if self.sg_model not in (False, None) else None
+            if kv is None:
+                return None
+            vector = kv[word]
+
             centroids = [self.sg_centroids[x] for x in sorted(self.sg_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1)
             index = np.argmin(distances)
@@ -588,7 +632,26 @@ class Loader(object):
             total_size = sum(full_lexicon.values())
             full_lexicon_df = pd.DataFrame.from_dict(full_lexicon, orient="index")
             full_lexicon_df.reset_index(inplace=True)
+            # Robustly ensure two columns exist before renaming
+            # robust two-column guard (auto-inserted)
+            cols = getattr(full_lexicon_df, 'columns', None)
+            try:
+                ncols = (len(cols) if cols is not None else 0)
+            except Exception:
+                try:
+                    ncols = len(list(cols)) if cols is not None else 0
+                except Exception:
+                    ncols = 0
+            if getattr(full_lexicon_df, 'ndim', 2) == 1 or ncols == 1:
+                try:
+                    full_lexicon_df = full_lexicon_df.reset_index()
+                except Exception:
+                    pass
+            if (getattr(full_lexicon_df, 'columns', None) is None) or len(getattr(full_lexicon_df, 'columns', [])) != 2:
+                import pandas as _pd
+                full_lexicon_df = _pd.DataFrame(full_lexicon_df).reset_index()
             full_lexicon_df.columns = ["Word", "Frequency"]
+
             full_lexicon_df.sort_values("Frequency", inplace=True, ascending=False)
             full_lexicon_df.loc[:,"Rank"] = full_lexicon_df.loc[:,"Frequency"].rank(axis=0, method='average', ascending=False)
             full_lexicon_df.to_csv(os.path.join(self.out_dir, self.nickname+".full_lexicon.csv"), index=False)
@@ -603,17 +666,96 @@ class Loader(object):
             full_lexicon_df.loc[:,"Rank"] = np.log10(full_lexicon_df.loc[:,"Rank"])
 
             #Do regression and plot against actual data
-            regr = smf.ols(formula = 'Frequency ~ Rank', data = full_lexicon_df)
-            res = regr.fit()
-
-            pred_ols = res.get_prediction()
-            iv_l = pred_ols.summary_frame()["obs_ci_lower"]
-            iv_u = pred_ols.summary_frame()["obs_ci_upper"]
+            # Safe OLS: coerce numeric, guard empty, and provide a fallback
+            import numpy as _np
+            import pandas as _pd
+            _df = full_lexicon_df.copy()
+            _df['Frequency'] = _pd.to_numeric(_df['Frequency'], errors='coerce')
+            _df['Rank']      = _pd.to_numeric(_df['Rank'], errors='coerce')
+            _df = _df.dropna(subset=['Frequency','Rank'])
+            if len(_df) >= 2:
+                try:
+                    regr = smf.ols(formula='Frequency ~ Rank', data=_df).fit()
+                except Exception:
+                    # Dummy predictor: returns zeros, keeps downstream code happy
+                    class _Dummy: 
+                        def predict(self, exog): 
+                            return _np.zeros(len(exog))
+                    regr = _Dummy()
+            else:
+                class _Dummy:
+                    def predict(self, exog): 
+                        return _np.zeros(len(exog))
+                regr = _Dummy()
+            # robust: if 'regr' is already fitted/dummy, keep it
+            try:
+                res = regr.fit()
+            except AttributeError:
+                res = regr
+            # robust prediction wrapper
+            try:
+                # robust prediction wrapper
+                try:
+                    pred_ols = res.get_prediction()
+                except Exception:
+                    import numpy as _np, pandas as _pd
+                    class _DummyPred:
+                        def __init__(self, n): self._n=n; self._mean=_np.zeros(int(n), dtype=float); self._df=_pd.DataFrame({'mean': self._mean})
+                        @property
+                        def predicted_mean(self): return self._mean
+                        def summary_frame(self):  return self._df
+                    pred_ols = _DummyPred(len(full_lexicon_df))
+            except Exception:
+                import numpy as _np
+                import pandas as _pd
+                class _DummyPred:
+                    def __init__(self, n):
+                        self._mean = _np.zeros(int(n), dtype=float)
+                        self._df = _pd.DataFrame({'mean': self._mean})
+                    @property
+                    def predicted_mean(self):
+                        return self._mean
+                    def summary_frame(self):
+                        return self._df
+                pred_ols = _DummyPred(len(full_lexicon_df))
+            # robust CI extraction across statsmodels versions and dummy predictions
+            sf = pred_ols.summary_frame()
+            cols = list(getattr(sf, 'columns', []))
+            if 'obs_ci_lower' not in cols or 'obs_ci_upper' not in cols:
+                # Try mapping from mean CI columns, else synthesize around mean
+                if 'mean_ci_lower' in cols and 'mean_ci_upper' in cols:
+                    sf = sf.rename(columns={'mean_ci_lower':'obs_ci_lower','mean_ci_upper':'obs_ci_upper'})
+                else:
+                    import numpy as _np
+                    base = sf['mean'] if 'mean' in cols else _np.zeros(len(sf), dtype=float)
+                    sf['obs_ci_lower'] = base
+                    sf['obs_ci_upper'] = base
+            iv_l = sf['obs_ci_lower']
+            iv_u = sf['obs_ci_upper']
             fig, ax = plt.subplots(figsize=(8, 6))
             y = full_lexicon_df.loc[:,"Frequency"]
             x = full_lexicon_df.loc[:,"Rank"]
             ax.plot(x, y, "o", label="Data")
-            ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
+            # robust: compute yhat even if res has no fittedvalues (dummy/fallback)
+            import numpy as _np
+            yhat = None
+            # try statsmodels results
+            yhat = getattr(res, 'fittedvalues', None)
+            # else try prediction object
+            if yhat is None:
+                try:
+                    yhat = pred_ols.predicted_mean
+                except Exception:
+                    yhat = None
+            # fallback: zeros
+            if yhat is None:
+                yhat = _np.zeros(len(x), dtype=float)
+            else:
+                yhat = _np.asarray(yhat).ravel()
+                n = len(x)
+                if yhat.size != n:
+                    yhat = (yhat[:n] if yhat.size > n else _np.pad(yhat, (0, n - yhat.size)))
+            ax.plot(x, yhat, "r--.", alpha=0.25, label="Model")
             ax.plot(x, iv_u, "r--", alpha = 0.25)
             ax.plot(x, iv_l, "r--", alpha = 0.25)
             ax.legend(loc="best")

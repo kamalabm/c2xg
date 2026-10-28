@@ -4,8 +4,67 @@ import pandas as pd
 import multiprocessing as mp
 from gensim.models import FastText
 from gensim.models.fasttext import save_facebook_model
-from scipy.stats import mode # -> commented out on line 173? 
+from scipy.stats import mode # -> commented out on line 173?
 import kmedoids
+from sklearn.metrics import pairwise_distances
+from collections import defaultdict
+
+def _kv(model):
+    return getattr(model, "wv", model)
+
+def _get_mean_vector(model, keys, weights=None, pre_normalize=True, post_normalize=True):
+    import numpy as np
+    kv = _kv(model)
+    if weights is None:
+        weights = [1.0]*len(keys)
+    vecs, ws = [], []
+    for w, wt in zip(keys, weights):
+        try:
+            if hasattr(kv, "key_to_index") and w not in kv.key_to_index:
+                continue
+            v = kv[w]
+        except Exception:
+            continue
+        v = v.astype("float32", copy=False)
+        if pre_normalize:
+            n = float((v*v).sum()) ** 0.5
+            if n: v = v / n
+        vecs.append(v)
+        try:
+            ws.append(float(wt))
+        except Exception:
+            ws.append(1.0)
+    if not vecs:
+        dim = getattr(getattr(kv, "vectors", None), "shape", (1,100))[1]
+        return np.zeros(dim, dtype="float32")
+    arr = np.vstack(vecs)
+    ww  = np.asarray(ws, dtype="float32")
+    denom = float(ww.sum()) if float(ww.sum()) != 0.0 else 1.0
+    mean = (arr * ww[:, None]).sum(axis=0) / denom
+    if post_normalize:
+        n = float((mean*mean).sum()) ** 0.5
+        if n: mean = mean / n
+    return mean.astype("float32", copy=False)
+
+
+
+# ---- auto-inserted helper: clamp k to valid range ----
+def _clamp_k(_N, k=None, medoids=None):
+    # accept either k=... or medoids=... (as seen in c2xg codepaths)
+    if k is None:
+        k = medoids
+    try:
+        k = int(k)
+    except Exception:
+        k = 1 if not isinstance(N, int) or N <= 0 else N
+    try:
+        N = int(N)
+    except Exception:
+        N = 1
+    if N <= 1:
+        return max(1, N)
+    return max(1, min(k, N))
+# ---- end helper ----
 
 try:
     from sklearnex import patch_sklearn
@@ -13,13 +72,12 @@ try:
 
 except:
     print("UNABLE TO ACCELERATE SKLEARN")
-    
-from sklearn.metrics import pairwise_distances
+
 
 class Word_Classes(object):
 
     def __init__(self, Load):
-    
+
         self.Load = Load
 
     #----------------------------------------------------------------------------------#
@@ -48,222 +106,226 @@ class Word_Classes(object):
         return model
 
     #----------------------------------------------------------------------------------#
-    
-    def learn_categories(self, model, vocab, unique_words = None, variety = "cbow", top_range = False):
 
-        #Determine the number of clusters to use
-        #Set clusters for syntactic domains
-        if variety == "cbow":
-            #If unspecified, set cbow max clusters
-            if top_range == False:
-                top_range = 250
-            if top_range > len(vocab):
-                top_range = len(vocab)-10
-            cluster_range = range(top_range, 25, -5)
+    def learn_categories(self, model, vocab, unique_words=None, variety="cbow", top_range=None):
+        """
+        Cluster words into categories for CBOW/SG using k-medoids over cosine distances.
+        Returns (cluster_df, mean_dict)
+        """
+        import numpy as np
+        import pandas as pd
+        import multiprocessing as mp
+        from sklearn.metrics import pairwise_distances
+        import kmedoids
 
-        #Set clusters for semantic domains
-        elif variety == "sg":
-            #If unspecified, set sg max clusters
-            if top_range == False:
-                top_range = 2500
-            if top_range > len(vocab):
-                top_range = len(vocab)-10
-            cluster_range = range(top_range,250, -50)
-            
-        #Get the word embeddings specific to this lexicon
-        #remove phrases because their vectors aren't trained
-        word_list = [x for x in vocab.keys() if " " not in x]
-        phrase_list = [x for x in vocab.keys() if " " in x]
+        kv = getattr(model, "wv", model)
 
-        #Don't cluster very frequency words because they have their own behaviour
-        word_list = [x for x in word_list if x not in unique_words.loc[:,"Word"].values]
-        
-        #Ensure not more clusters than words
-        cluster_range = [x for x in list(cluster_range) if x < len(word_list)]
-        
-        #Get word vectors only for vocab
-        vectors = []
-        for word in word_list:
-            vector = model[word]
-            vectors.append(vector)      
-        vectors = np.vstack(vectors)
+        # filter to tokens present in embeddings
+        words_all = list(vocab.keys())
+        if hasattr(kv, "key_to_index"):
+            word_list = [w for w in words_all if w in kv.key_to_index]
+        else:
+            word_list = [w for w in words_all if w in kv]
+        if not word_list:
+            return pd.DataFrame(columns=["Rank","Word","Category","Category_Name"]), {}
 
-        print("Vocab and Vector Size:", end = "\t")
-        print(len(word_list), vectors.shape)
+        X = np.vstack([kv[w] for w in word_list]).astype(np.float64, copy=False)
+        distances = pairwise_distances(X, metric="cosine", n_jobs=1)
+        np.fill_diagonal(distances, 0.0)
+        distances = np.ascontiguousarray(distances, dtype=np.float64)
+        N = len(word_list)
 
-        print("Getting cosine distance matrix")
-        distances = pairwise_distances(X=vectors, Y=vectors, metric='cosine', n_jobs=mp.cpu_count())
-        del vectors
-        
-        #Initialize search
-        optimum_clusters = 0
-        optimum_sh = 0.0
-        n_turns_no_change = 0
-        
-        #Iterate over potential numbers of clusters
-        for n_clusters in cluster_range:
-            
-            km = kmedoids.fasterpam(diss = distances, 
-                                medoids = n_clusters, 
-                                max_iter=100000, 
-                                init='build', 
-                                n_cpu=mp.cpu_count(),
-                                )
-            
-            sh = kmedoids.medoid_silhouette(diss = distances, meds = km.labels)[0]
-            print("\t", n_clusters, ": With ", km.n_iter, " iterations and ", km.n_swap, " swaps. Loss:", km.loss, " Silhoutette: ", sh)
-            
-            #Check for a better score
-            if sh > optimum_sh + (sh * 0.001):
-                print("\t\tBetter Silhoutette score obtained: ", optimum_sh, " now ", sh)
-                optimum_sh = sh
-                optimum_clusters = n_clusters
-                n_turns_no_change = 0
-                
-                #Save current best clusters
-                cluster_labels = km.labels
-                cluster_exemplars = km.medoids
-                
-            else:
-                n_turns_no_change += 1
-                
-            if n_turns_no_change > 0:
-                print("No change for 1 iterations, stopping now.")
-                break
-        
-        results = []
-        for i in range(len(cluster_labels)):
-            member_word = word_list[i]
-            cluster = cluster_labels[i]
-            exemplar_word = cluster_exemplars[cluster]
-            exemplar_word_real = word_list[exemplar_word]
-            results.append([member_word, cluster])
-        
-        cluster_df = pd.DataFrame(results, columns = ["Word", "Cluster"])
+        def _default_range(n):
+            if n >= 250:  return range(250, 200, -5)
+            if n >= 100:  return range(min(100, n), max(10, n//10), -5)
+            if n >= 20:   return range(min(20,  n), max(2,  n//5),  -1)
+            return range(1, min(2, n)+1)
 
-        #Save mean vectors for assigning phrases to clusters
+        # normalize top_range into an iterable of ints
+        if top_range is None or isinstance(top_range, bool):
+            cluster_range = _default_range(N)
+        elif isinstance(top_range, int):
+            cluster_range = range(min(top_range, N), max(1, min(10, N//10)) - 1, -1)
+        else:
+            cluster_range = [k for k in top_range if isinstance(k, int) and 1 <= k <= N] or list(_default_range(N))
+
+        best_sh = -1.0
+        best_labels = [0]*N
+
+        for k in cluster_range:
+            if k > N:
+                continue
+            km = kmedoids.fasterpam(distances, medoids=k, max_iter=100000, init='build', n_cpu=mp.cpu_count())
+            meds = getattr(km, 'medoids', None)
+            meds = np.asarray(meds) if meds is not None else np.array([], dtype=int)
+            if meds.size == 0:
+                continue
+
+            sh = float(kmedoids.medoid_silhouette(diss=distances, meds=meds)[0])
+            print("\t {} : With {} iterations and {} swaps. Loss: {}  Silhouette: {}".format(
+                k, getattr(km, 'n_iter', 'NA'), getattr(km, 'n_swap', 'NA'), getattr(km, 'loss', 'NA'), sh))
+
+            if sh > (best_sh + (abs(sh) * 0.001)):
+                best_sh = sh
+                best_labels = np.argmin(distances[:, meds], axis=1).astype(int).tolist()
+
+        if not isinstance(best_labels, list) or len(best_labels) != N:
+            best_labels = [0] * N
+
+        cluster_df = pd.DataFrame({"Word": word_list, "Cluster": best_labels})
+
+        # per-cluster ranking & mean vectors
+        from collections import defaultdict
+        complete = []
         mean_dict = {}
         name_dict = {}
-        complete_clusters = []
 
-        #Get proto-type structure and exemplars
-        for category, category_df in cluster_df.groupby("Cluster"):
-
-            #First, get proto-type structure of the cluster
-            ranks = model.rank_by_centrality(words=category_df.loc[:,"Word"], use_norm=True)
-            ranks = pd.DataFrame(ranks, columns = ["Rank", "Word"])
-            ranks.loc[:,"Category"] = category            
-
-            #Second, get the best example of the category
-            mean_vector = model.get_mean_vector(keys=ranks.loc[:,"Word"], weights=ranks.loc[:,"Rank"], pre_normalize=True, post_normalize=True)
-            mean_dict[category] = mean_vector
-
-            #Third, filter the best examples to reflect this particular lexicon
-            exemplars = model.similar_by_vector(mean_vector, topn=10000)
-            exemplars = [x for x,y in exemplars if x in vocab.keys()]
-            exemplars = [x for x in exemplars if x in word_list]
-            
-            #If there are no exemplars, just use the first ones
-            if len(exemplars) < 2:
-                exemplars = category_df.loc[:,"Word"].values
-            
-            #Choose the top ones
-            exemplars = exemplars[:2]
-            name_dict[category] = exemplars
-            exemplar_name = "_".join(exemplars)
-            ranks.loc[:,"Category_Name"] = exemplar_name
-            complete_clusters.append(ranks)
-
-        #Assign phrases
-        phrase_results = []
-
-        for phrase in phrase_list:
-            vector = model[phrase]
-            distances = pairwise_distances(vector.reshape(1, -1), list(mean_dict.values()), metric="cosine", n_jobs=mp.cpu_count())
-            phrase_cluster = np.argmin(distances)
-            phrase_cluster_name = "_".join(name_dict[phrase_cluster])
-            phrase_results.append([0.0, phrase, phrase_cluster, phrase_cluster_name])
-
-        #For CBOW, add unique_words as their own categories
-        #For SG, unique_words do not belong to a cluster
-        if variety == "cbow":
-            unique_results = []
-            starting = max(name_dict.keys()) + 1
-            
-            for word in unique_words.loc[:,"Word"].values:
-                unique_results.append([0.0, word, starting, "unique_"+word])
-                starting += 1
-            unique_df = pd.DataFrame(unique_results, columns = ["Rank", "Word", "Category", "Category_Name"])
-            complete_clusters.append(unique_df)
-
-        #Merge and save all category rankings
-        phrase_df = pd.DataFrame(phrase_results, columns = ["Rank", "Word", "Category", "Category_Name"])
-        complete_clusters.append(phrase_df)
-        
-        #Merge, sort and prep the category lexicon
-        cluster_df = pd.concat(complete_clusters)
-        cluster_df = cluster_df.sort_values(by = ["Category", "Rank"], ascending=False)
-        cluster_df = cluster_df.reset_index(drop=True)
-  
-        return cluster_df, mean_dict
-        
-    #-------------------------------------------------------------------------------#
-    
-    def learn_construction_categories(self, grammar, similarity_matrix, num_clusters = None):
-    
-        #Set range of construction clusters
-        if num_clusters == None:
-            cluster_range = range(int(len(grammar)/200)+11, 10, -5)
-        else:
-            cluster_range = num_clusters
-        
-        #Initialize search
-        optimum_clusters = 0
-        optimum_sh = 0.0
-        n_turns_no_change = 0
-        
-        print("\tStarting to cluster with a range of " + str(cluster_range))
-        #Iterate over potential numbers of clusters
-        for n_clusters in cluster_range:
-        
-            #Safety check
-            if n_clusters > len(grammar):
-                n_clusters = len(grammar)-1
-                
-            km = kmedoids.fasterpam(diss = similarity_matrix, 
-                                medoids = n_clusters, 
-                                max_iter=100000, 
-                                init='build', 
-                                n_cpu=mp.cpu_count(),
-                                )
-            
-            sh = kmedoids.medoid_silhouette(diss = similarity_matrix, meds = km.labels)[0]
-            print("\t", n_clusters, ": With ", km.n_iter, " iterations and ", km.n_swap, " swaps. Loss:", km.loss, " Silhoutette: ", sh)
-            
-            #Check for a better score
-            if sh > optimum_sh + (sh * 0.001):
-                print("\t\tBetter Silhoutette score obtained: ", optimum_sh, " now ", sh)
-                optimum_sh = sh
-                optimum_clusters = n_clusters
-                n_turns_no_change = 0
-                
-                #Save current best clusters
-                cluster_labels = km.labels
-                cluster_exemplars = km.medoids
-                
+        for cat, cat_df in cluster_df.groupby("Cluster"):
+            tokens = cat_df["Word"].astype(str).tolist()
+            if hasattr(kv, "key_to_index"):
+                tokens = [w for w in tokens if w in kv.key_to_index]
             else:
-                n_turns_no_change += 1
-                
-            if n_turns_no_change > 5:
-                print("No change for 6 iterations, stopping now.")
-                break
-        
-        results = []
-        for i in range(len(cluster_labels)):
-            member_construction = grammar[i]
-            cluster = cluster_labels[i]
-            results.append([member_construction, cluster])
-        
-        cluster_df = pd.DataFrame(results, columns = ["Chunk", "Cluster"])
-    
-        return cluster_df
+                tokens = [w for w in tokens if w in kv]
+            if not tokens:
+                continue
+
+            if hasattr(model, "rank_by_centrality"):
+                ranks_list = model.rank_by_centrality(words=tokens, use_norm=True)
+            else:
+                ranks_list = [(1.0, w) for w in tokens]
+            ranks = pd.DataFrame(ranks_list, columns=["Rank","Word"])
+            if ranks.empty:
+                continue
+            ranks.loc[:, "Category"] = cat
+
+            mean_vector = _get_mean_vector(model, keys=ranks["Word"], weights=ranks["Rank"],
+                                           pre_normalize=True, post_normalize=True)
+            if mean_vector is None or getattr(mean_vector, "size", 0) == 0:
+                continue
+            mean_dict[cat] = mean_vector
+
+            if hasattr(kv, "similar_by_vector"):
+                ex = [w for (w,_s) in kv.similar_by_vector(mean_vector, topn=10000) if w in tokens]
+            else:
+                ex = ranks.sort_values("Rank", ascending=False)["Word"].tolist()
+            if len(ex) < 2:
+                ex = tokens[:2]
+            name_dict[cat] = ex[:2]
+            ranks.loc[:, "Category_Name"] = "_".join(name_dict[cat])
+            complete.append(ranks)
+
+        if not complete:
+            return pd.DataFrame(columns=["Rank","Word","Category","Category_Name"]), {}
+
+        merged = pd.concat(complete, ignore_index=True)
+
+        # optional phrase assignment
+        phrase_results = []
+        phrase_list = []
+        try:
+            phrase_list = list(getattr(self, "phrase_list", []))
+        except Exception:
+            pass
+        if phrase_list and mean_dict:
+            centroids = np.vstack([mean_dict[c] for c in sorted(mean_dict.keys())]).astype(np.float64, copy=False)
+            from sklearn.metrics import pairwise_distances as _pwd
+            for ph in phrase_list:
+                try:
+                    v = kv[ph]
+                except Exception:
+                    continue
+                d = _pwd(v.reshape(1, -1), centroids, metric="cosine", n_jobs=1)
+                cl = int(np.argmin(d))
+                cname = "_".join(name_dict.get(cl, ["cluster", str(cl)]))
+                phrase_results.append([0.0, ph, cl, cname])
+        if phrase_results:
+            phrase_df = pd.DataFrame(phrase_results, columns=["Rank","Word","Category","Category_Name"])
+            merged = pd.concat([merged, phrase_df], ignore_index=True)
+
+        # CBOW unique tokens as their own categories
+        if (variety == "cbow") and (unique_words is not None):
+            try:
+                if not unique_words.empty:
+                    start_cat = int(merged["Category"].max()) + 1 if "Category" in merged.columns and not merged.empty else 0
+                    uw_rows = []
+                    for w in unique_words["Word"].astype(str).tolist():
+                        uw_rows.append([0.0, w, start_cat, "unique_"+w]); start_cat += 1
+                    if uw_rows:
+                        uw_df = pd.DataFrame(uw_rows, columns=["Rank","Word","Category","Category_Name"])
+                        merged = pd.concat([merged, uw_df], ignore_index=True)
+            except Exception:
+                pass
+
+        merged = merged.sort_values(by=["Category","Rank"], ascending=False, kind="mergesort").reset_index(drop=True)
+        return merged, mean_dict
+
+    def learn_construction_categories(self, grammar, similarity_matrix):
+        """
+        Cluster constructions using k-medoids. Accepts a similarity (1.0 on diag) or
+        a distance matrix. Returns DataFrame(Chunk, Cluster).
+        """
+        import numpy as np
+        import pandas as pd
+        import multiprocessing as mp
+        import kmedoids
+
+        grammar = [eval(g) if isinstance(g, str) else g for g in grammar]
+        if not grammar:
+            return pd.DataFrame(columns=["Chunk","Cluster"])
+
+        mat = similarity_matrix
+        if isinstance(mat, pd.DataFrame):
+            mat = mat.values
+        mat = np.asarray(mat, dtype=np.float64)
+
+        if mat.ndim != 2 or mat.shape[0] != mat.shape[1]:
+            raise ValueError(f"Construction matrix must be square, got {mat.shape}")
+
+        if mat.min() >= 0.0 and mat.max() <= 1.0 and np.allclose(np.diag(mat), 1.0, atol=1e-6):
+            dist = 1.0 - mat
+        else:
+            dist = mat
+        dist = np.nan_to_num(dist, nan=0.0, posinf=1.0, neginf=0.0)
+        np.fill_diagonal(dist, 0.0)
+        dist = np.ascontiguousarray(dist, dtype=np.float64)
+
+        N = dist.shape[0]
+        if N != len(grammar):
+            M = min(N, len(grammar))
+            dist = np.ascontiguousarray(dist[:M, :M], dtype=np.float64)
+            grammar = grammar[:M]
+
+        def _sweep(n):
+            if n >= 40: return range(40, 10, -5)
+            if n >= 15: return range(min(15, n), max(3, n//3), -2)
+            if n >= 4:  return range(min(4, n), 1, -1)
+            return [1]
+
+        best_sh = -1.0
+        best_labels = [0]*len(grammar)
+
+        for k in _sweep(len(grammar)):
+            if k > len(grammar):
+                continue
+            
+            km = kmedoids.fasterpam(dist, medoids=k, max_iter=100000, init='build', n_cpu=mp.cpu_count())
+            
+            meds = getattr(km, "medoids", [])
+            meds = None if meds is None else np.asarray(meds)
+            if meds is None or getattr(meds, 'size', len(meds)) == 0:
+                continue
+
+            sh = float(kmedoids.medoid_silhouette(diss=dist, meds=meds)[0])
+            print("     {} : With {} iterations and {} swaps. Loss: {}  Silhouette: {}".format(
+                k,getattr(km, 'n_iter', 'NA'), getattr(km, 'n_swap', 'NA'), getattr(km, 'loss', 'NA'), sh))
+
+            if sh > (best_sh + (abs(sh)*0.001)):
+                best_sh = sh
+                best_labels = np.argmin(dist[:, meds], axis=1).astype(int).tolist()
+
+        if not best_labels or len(best_labels) != len(grammar):
+            best_labels = [0]*len(grammar)
+
+        return pd.DataFrame({"Chunk": [str(g) for g in grammar], "Cluster": best_labels})
+
+
