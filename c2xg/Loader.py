@@ -145,14 +145,28 @@ class Loader(object):
         word = str(word)
         
         if type == "cbow":
-            vector = self.cbow_model[word]
+            #vector = self.cbow_model.wv[word]
+            #vector = self.cbow_model[word]
+
+            if hasattr(self.cbow_model, 'wv'):
+                vector = self.cbow_model.wv[word]
+            else:
+                vector = self.cbow_model[word]
+
             centroids = [self.cbow_centroids[x] for x in sorted(self.cbow_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1) 
             index = np.argmin(distances)
             self.cbow_encode[word] = index
             
         elif type == "sg":
-            vector = self.sg_model[word]
+            #vector = self.sg_model.wv[word]
+            #vector = self.sg_model[word]
+
+            if hasattr(self.cbow_model, 'wv'):
+                vector = self.cbow_model.wv[word]
+            else:
+                vector = self.cbow_model[word]
+
             centroids = [self.sg_centroids[x] for x in sorted(self.sg_centroids.keys())]
             distances = pairwise_distances(vector.reshape(1, -1), centroids, metric="cosine", n_jobs=1)
             index = np.argmin(distances)
@@ -567,78 +581,84 @@ class Loader(object):
     
     #---------------------------------------------------------------------------#
 
-    def get_lexicon(self, input_data, npmi_threshold = 0.75, min_count = 1, max_vocab = None):
+    def get_lexicon(self, input_data, npmi_threshold=0.75, min_count=1, max_vocab=None):
 
         if isinstance(input_data, str):
             
-            #Get data
+            # Get data
             data = self.read_file(input_data)
-            data = [self.clean(line, encode = False) for line in data]
+            data = [self.clean(line, encode=False) for line in data]
 
-            #Find phrases, then freeze
-            phrase_model = Phrases(data, min_count = min_count, threshold = npmi_threshold, scoring = "npmi", delimiter = " ")
+            # Find phrases, then freeze
+            phrase_model = Phrases(data, min_count=min_count, threshold=npmi_threshold, scoring="npmi", delimiter=" ")
             phrases = phrase_model.freeze()
 
-            #Get full lexicon without potential phrases
+            # Get full lexicon without potential phrases
             full_lexicon = phrase_model.vocab
             threshold = lambda x: " " not in x
             full_lexicon = ct.keyfilter(threshold, full_lexicon)
 
-            #Get Zipfian statistics about the full lexicon
-            total_size = sum(full_lexicon.values())
-            full_lexicon_df = pd.DataFrame.from_dict(full_lexicon, orient="index")
-            full_lexicon_df.reset_index(inplace=True)
-            full_lexicon_df.columns = ["Word", "Frequency"]
+            # glfix: create DataFrame properly
+            full_lexicon_df = pd.DataFrame(list(full_lexicon.items()), columns=["Word", "Frequency"])  # glfix
+            full_lexicon_df = full_lexicon_df[full_lexicon_df["Frequency"] > 0]  # glfix: remove zero frequencies
             full_lexicon_df.sort_values("Frequency", inplace=True, ascending=False)
-            full_lexicon_df.loc[:,"Rank"] = full_lexicon_df.loc[:,"Frequency"].rank(axis=0, method='average', ascending=False)
-            full_lexicon_df.to_csv(os.path.join(self.out_dir, self.nickname+".full_lexicon.csv"), index=False)
+            full_lexicon_df["Rank"] = full_lexicon_df["Frequency"].rank(method="average", ascending=False)
+            full_lexicon_df.to_csv(os.path.join(self.out_dir, self.nickname + ".full_lexicon.csv"), index=False)
 
-            #Get a list of words which account for over 1% of the total data
-            threshold = total_size/100
-            unique_words = full_lexicon_df[full_lexicon_df.loc[:,"Frequency"] > threshold]
+            # Get a list of words which account for over 1% of the total data
+            total_size = sum(full_lexicon.values())
+            threshold = total_size / 1000
+            unique_words = full_lexicon_df[full_lexicon_df["Frequency"] > threshold]
 
-            #Prepare to estimate Zipfian distribution
-            full_lexicon_df.loc[:,"Actual_Frequency"] = full_lexicon_df.loc[:,"Frequency"]
-            full_lexicon_df.loc[:,"Frequency"] = np.log10(full_lexicon_df.loc[:,"Frequency"])
-            full_lexicon_df.loc[:,"Rank"] = np.log10(full_lexicon_df.loc[:,"Rank"])
+            # Prepare to estimate Zipfian distribution
+            full_lexicon_df["Actual_Frequency"] = full_lexicon_df["Frequency"]
+            full_lexicon_df["Frequency"] = np.log10(full_lexicon_df["Frequency"])  # glfix
+            full_lexicon_df["Rank"] = np.log10(full_lexicon_df["Rank"])  # glfix
 
-            #Do regression and plot against actual data
-            regr = smf.ols(formula = 'Frequency ~ Rank', data = full_lexicon_df)
-            res = regr.fit()
+            # glfix: drop NaNs and infs after log
+            full_lexicon_df = full_lexicon_df.replace([np.inf, -np.inf], np.nan).dropna(subset=["Frequency", "Rank"])  # glfix
 
-            pred_ols = res.get_prediction()
-            iv_l = pred_ols.summary_frame()["obs_ci_lower"]
-            iv_u = pred_ols.summary_frame()["obs_ci_upper"]
-            fig, ax = plt.subplots(figsize=(8, 6))
-            y = full_lexicon_df.loc[:,"Frequency"]
-            x = full_lexicon_df.loc[:,"Rank"]
-            ax.plot(x, y, "o", label="Data")
-            ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
-            ax.plot(x, iv_u, "r--", alpha = 0.25)
-            ax.plot(x, iv_l, "r--", alpha = 0.25)
-            ax.legend(loc="best")
-            plt.xlabel("Rank (Log)")
-            plt.ylabel("Frequency (Log)")
-            plt.savefig(os.path.join(self.out_dir, self.nickname+".lexicon_distribution.png"), dpi=300, bbox_inches = "tight")
-            
-            #Reduce lexicon to min_count
+            # glfix: ensure numeric dtype
+            full_lexicon_df["Frequency"] = pd.to_numeric(full_lexicon_df["Frequency"], errors="coerce")
+            full_lexicon_df["Rank"] = pd.to_numeric(full_lexicon_df["Rank"], errors="coerce")
+
+            # Regression and plot
+            if not full_lexicon_df.empty:  # glfix: make sure it's not empty
+                regr = smf.ols(formula='Frequency ~ Rank', data=full_lexicon_df)  # glfix
+                res = regr.fit()
+
+                pred_ols = res.get_prediction()
+                iv_l = pred_ols.summary_frame()["obs_ci_lower"]
+                iv_u = pred_ols.summary_frame()["obs_ci_upper"]
+                fig, ax = plt.subplots(figsize=(8, 6))
+                y = full_lexicon_df["Frequency"]
+                x = full_lexicon_df["Rank"]
+                ax.plot(x, y, "o", label="Data")
+                ax.plot(x, res.fittedvalues, "r--.", alpha=0.25, label="Model")
+                ax.plot(x, iv_u, "r--", alpha=0.25)
+                ax.plot(x, iv_l, "r--", alpha=0.25)
+                ax.legend(loc="best")
+                plt.xlabel("Rank (Log)")
+                plt.ylabel("Frequency (Log)")
+                plt.savefig(os.path.join(self.out_dir, self.nickname + ".lexicon_distribution.png"), dpi=300, bbox_inches="tight")
+
+            else:
+                print("Warning: full_lexicon_df was empty after log transform; skipping regression.")  # glfix
+
+            # Reduce lexicon to min_count
             threshold = lambda x: x >= min_count
             lexicon = ct.valfilter(threshold, phrase_model.vocab)
-            
-            #Remove unkept phrases from lexicon
-            remove_list = []
-            for key in lexicon:
-                if " " in key and key not in phrases.phrasegrams:
-                    remove_list.append(key)
+
+            # Remove unkept phrases from lexicon
+            remove_list = [key for key in lexicon if " " in key and key not in phrases.phrasegrams]
             for key in remove_list:
                 lexicon.pop(key)
-                
-            #Reduce to max vocab
-            if max_vocab != None:
+
+            # Reduce to max vocab
+            if max_vocab is not None:
                 lexicon = dict(sorted(lexicon.items(), key=lambda x: x[1], reverse=True)[:max_vocab])
                 print("REDUCED ", len(lexicon))
-            
+
             return lexicon, phrases, unique_words, full_lexicon_df
 
-    #---------------------------------------------------------------------------#
-            
+    #------------------------------------------------------------#

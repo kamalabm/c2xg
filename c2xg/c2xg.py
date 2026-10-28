@@ -356,8 +356,10 @@ class C2xG(object):
                     model_name = os.path.split(model)[1]
                 except:
                     model_name = model
-                    
-                self.nickname = model.replace(".model.zip", "")
+                
+                #self.nickname = model.replace(".model.zip", "") #Replaced by next two lines
+                model_name = os.path.basename(model)
+                self.nickname = model_name.replace(".model.zip", "")
                 print("Current nickname: " + self.nickname)
                 print("Current model file: " + model_name)
 
@@ -417,21 +419,24 @@ class C2xG(object):
                 
         #Load embeddings from model file
         elif model != False:
-        
+
             #Check if model exists in the current working directory
             if not os.path.exists(model):
             
                 #Otherwise, check the out directory
                 if os.path.exists(os.path.join(self.out_dir, model)):
                     model = os.path.join(self.out_dir, model)
-                
+            
+            self.cbow_file = None
+            self.sg_file = None
+
             with zipfile.ZipFile(model, mode="r") as archive:
                 for filename in archive.namelist():
                     if ".cbow.bin" in filename:
                         self.cbow_file = filename
                     elif ".sg.bin" in filename:
                         self.sg_file = filename
-          
+
             #Load cbow embeddings from model zip       
             print("Using for local word embeddings: ", self.cbow_file)
             self.cbow_model = self.load_embeddings(self.cbow_file, archive=model)
@@ -673,6 +678,8 @@ class C2xG(object):
         #Check embeddings
         if self.cbow_model == False and self.sg_model == False:
             self.learn_embeddings(input_data)
+            self.Load.cbow_model = self.cbow_model
+            self.Load.sg_model = self.sg_model
 
         #Check for syntactic clusters and form them if necessary
         cbow_df_file = os.path.join(self.out_dir, self.nickname + ".categories_cbow.csv")
@@ -2066,6 +2073,11 @@ class C2xG(object):
         
         #Cluster
         cluster_df = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix)
+        #gpt#max_k = min(len(grammar), 30)  # set a sane upper bound
+        #gpt#min_k = max(2, int(len(grammar) / 10))  # or 2 if grammar is small
+        #gpt#cluster_range = range(max_k, min_k - 1, -1)
+
+        #gpt#cluster_df = self.Word_Classes.learn_construction_categories(grammar, similarity_matrix, num_clusters = cluster_range)
 
         return cluster_df
  

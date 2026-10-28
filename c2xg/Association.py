@@ -167,20 +167,36 @@ class Association(object):
         return ngrams
     #--------------------------------------------------------------------------------------------#
 
-    def find_ngrams(self, data, lex_only = False, n_gram_threshold = 0):
+#    def find_ngrams(self, data, lex_only = False, n_gram_threshold = 0):
+#
+#        ngrams = self.process_ngrams(data, lex_only = lex_only)
+#        
+#        #print("\tTOTAL NGRAMS: " + str(len(list(ngrams.keys()))))
+#        print("\tTOTAL WORDS: " + str(ngrams["TOTAL"]))
+#        
+#        #Now enforce threshold
+#        keepable = lambda x: x > n_gram_threshold
+#        ngrams = ct.valfilter(keepable, ngrams)
+#        
+#        #print("\tAfter pruning:")
+#        print("\tTOTAL NGRAMS: " + str(len(list(ngrams.keys()))))
+#            
+#        return ngrams
 
+    def find_ngrams(self, data, lex_only = False, n_gram_threshold = 0):
         ngrams = self.process_ngrams(data, lex_only = lex_only)
         
-        #print("\tTOTAL NGRAMS: " + str(len(list(ngrams.keys()))))
-        print("\tTOTAL WORDS: " + str(ngrams["TOTAL"]))
-        
-        #Now enforce threshold
-        keepable = lambda x: x > n_gram_threshold
-        ngrams = ct.valfilter(keepable, ngrams)
-        
-        #print("\tAfter pruning:")
-        print("\tTOTAL NGRAMS: " + str(len(list(ngrams.keys()))))
-            
+        total = ngrams.get("TOTAL", 0)
+        print("\tTOTAL WORDS:", total)
+    
+        # Remove TOTAL before filtering, then restore
+        if "TOTAL" in ngrams:
+            del ngrams["TOTAL"]
+    
+        ngrams = ct.valfilter(lambda x: x > n_gram_threshold, ngrams)
+        ngrams["TOTAL"] = total
+    
+        print("\tTOTAL NGRAMS:", len(ngrams))
         return ngrams
 
     #---------------------------------------------------------------------------------------------#
